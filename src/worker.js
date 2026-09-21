@@ -74,14 +74,27 @@ function noAuthHeaders(env) {
 }
 
 /**
- * credits == 0 means free right now. An absent or empty value is *unrated*
- * and must never be reported as free.
+ * Parse the upstream `credits` field.
+ *
+ * It is a display string, not a number: "x0.00", "x0.34 credits", "x3.31",
+ * or "" when unrated. Number("x0.00") is NaN, so treating it numerically
+ * marks every model as unknown and quietly disables free-only filtering.
+ *
+ * Returns 0 for free, a positive number for paid, or null when unrated.
  */
 function creditOf(c) {
-  if (c === undefined || c === null || c === '') return null;
-  const v = Number(c);
-  return Number.isNaN(v) ? null : v;
+  if (c === undefined || c === null) return null;
+  if (typeof c === 'number') return Number.isFinite(c) ? c : null;
+
+  const s = String(c).trim();
+  if (!s) return null;                       // "" -> unrated
+  const m = s.match(/(\d+(?:\.\d+)?)/);      // first number anywhere
+  if (!m) return null;
+  const v = Number(m[1]);
+  return Number.isFinite(v) ? v : null;
 }
+
+const isFree = (m) => creditOf(m.credits !== undefined ? m.credits : m.credit) === 0;
 
 const FREE_FALLBACK = [
   { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash · Free now' },
@@ -120,20 +133,20 @@ async function fetchModels(env, force) {
           const id = m.id || m.model;
           if (!id) continue;
           const credits = m.credits !== undefined ? m.credits : m.credit;
-          const free = creditOf(credits) === 0;
+          const v = creditOf(credits);
+          const free = v === 0;
           const base = m.name || id;
+          // Label free models by name and paid ones with their rate, so the
+          // two variants that share an upstream name stay distinguishable.
           const label =
-            creditOf(credits) === null
-              ? base
-              : free
-                ? `${base} · Free now`
-                : `${base} · x${credits}`;
+            v === null ? base : free ? `${base} · 免费` : `${base} · ${String(credits).trim()}`;
           list.push({
             id,
             name: label,
             free,
-            contextWindow: m.contextWindow || m.context_window || 128000,
-            maxTokens: m.maxTokens || m.max_tokens || 8192,
+            credits: v,
+            contextWindow: m.maxInputTokens || m.contextWindow || m.context_window || 128000,
+            maxTokens: m.maxOutputTokens || m.maxTokens || m.max_tokens || 8192,
           });
         }
         source = 'remote';
@@ -145,16 +158,30 @@ async function fetchModels(env, force) {
 
   if (!list) list = FREE_FALLBACK;
 
-  const freeCount = list.filter((m) => m.free).length;
-  // Never expose zero models: if free-only would empty the list, serve all.
-  const exposed = env.FREE_ONLY === 'true' && freeCount ? list.filter((m) => m.free) : list;
+  const freeList = list.filter((m) => m.free);
+  const freeCount = freeList.length;
+
+  // Free-only must never widen to the paid list. An earlier version fell back
+  // to serving every model when no free one was found, which is exactly the
+  // case where spending money is most likely — a parse failure would have
+  // silently exposed 19 paid models.
+  //
+  // If free-only yields nothing, serve nothing: an empty list makes the
+  // caller stop, while a paid list makes it spend.
+  const exposed = env.FREE_ONLY === 'true' ? freeList : list;
+  const note =
+    env.FREE_ONLY === 'true' && freeCount === 0
+      ? '当前没有免费模型可用，已按免费模式返回空列表。如需强制放行全部模型，请在管理页关闭「仅免费」。'
+      : '';
 
   const result = {
     at: Date.now(),
     source,
     all: list.length,
     free: freeCount,
+    freeOnly: env.FREE_ONLY === 'true',
     exposed,
+    note,
   };
   await env.KEYS.put('models:cache', JSON.stringify(result));
   return result;
@@ -238,6 +265,29 @@ async function handleModels(env, force) {
  */
 async function handleChat(req, env) {
   const body = await req.text();
+
+  // Free-only has to be enforced here, not just in the model listing. A
+  // client can request any model id directly, so filtering the list alone
+  // would still allow a paid model to be invoked and billed.
+  if (env.FREE_ONLY === 'true') {
+    let model = null;
+    try {
+      model = JSON.parse(body).model;
+    } catch {
+      return json({ error: { message: '请求体不是合法 JSON', type: 'invalid_request_error' } }, 400);
+    }
+    const c = await fetchModels(env, false);
+    if (!c.exposed.some((m) => m.id === model)) {
+      return json({
+        error: {
+          message: `模型「${model}」不是当前免费模型，已按仅免费模式拒绝。可用：` +
+            c.exposed.map((m) => m.id).join(', '),
+          type: 'invalid_request_error',
+          code: 'model_not_free',
+        },
+      }, 403);
+    }
+  }
 
   // WorkBuddy serves completions under /v2, not /v1. Verified against the
   // working DSH plugin and confirmed by probing: every /v1 variant returns

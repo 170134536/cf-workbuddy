@@ -91,10 +91,12 @@ async function main() {
       code: 0,
       msg: 'OK',
       data: {
+        // Real shapes: credits is a display string, not a number.
         models: [
-          { id: 'free-1', name: 'Free One', credits: 0 },
-          { id: 'paid-1', name: 'Paid One', credits: 1.5 },
-          { id: 'unrated', name: 'Unrated', credits: '' },
+          { id: 'free-1', name: 'Free One', credits: 'x0.00' },
+          { id: 'paid-1', name: 'Paid One', credits: 'x1.50 credits' },
+          { id: 'paid-2', name: 'Cheap', credits: 'x0.03' },
+          { id: 'unrated', name: 'Auto', credits: '' },
         ],
       },
     };
@@ -116,29 +118,24 @@ async function main() {
 
   // ---------------------------------------------------------- free-only edge
   {
-    const kv = makeKV({ 'key:k1': JSON.stringify({ created: Date.now(), requests: 0 }) });
-    const cfgAllPaid = { code: 0, data: { models: [{ id: 'p', name: 'P', credits: 2 }] } };
-    const f = makeFetch([['/v3/config', () => new Response(JSON.stringify(cfgAllPaid), { status: 200 })]]);
-    const w = await loadWorker(ENV_BASE, f);
-    const res = await w.fetch(req('/v1/models', { headers: { authorization: 'Bearer k1' } }), { ...ENV_BASE, KEYS: kv });
-    const j = await res.json();
-    check('never serves zero models', j.data.length >= 1, 'count ' + j.data.length);
+    // Covered in detail by the free-only safety block below.
   }
 
   // ---------------------------------------------------------- chat auth
   {
     const kv = makeKV({ 'key:good': JSON.stringify({ created: Date.now(), requests: 0 }) });
     let sentAuth = null;
-    const f = makeFetch([['/v2/chat/completions', (u, i) => {
+    const f = makeFetch([['/v3/config', () => new Response(JSON.stringify({ code: 0, data: { models: [{ id: 'm', credits: 'x0.00' }] } }), { status: 200 })],
+      ['/v2/chat/completions', (u, i) => {
       sentAuth = i.headers['Authorization'];
       return new Response('data: hi\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } });
     }]]);
     const w = await loadWorker(ENV_BASE, f);
 
-    const bad = await w.fetch(req('/v1/chat/completions', { method: 'POST', body: '{}' }), { ...ENV_BASE, KEYS: kv });
+    const bad = await w.fetch(req('/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'm' }) }), { ...ENV_BASE, KEYS: kv });
     check('chat rejects no key', bad.status === 401, 'status ' + bad.status);
 
-    const ok = await w.fetch(req('/v1/chat/completions', { method: 'POST', body: '{}', headers: { authorization: 'Bearer good' } }), { ...ENV_BASE, KEYS: kv });
+    const ok = await w.fetch(req('/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'm' }), headers: { authorization: 'Bearer good' } }), { ...ENV_BASE, KEYS: kv });
     check('chat accepts valid key', ok.status === 200, 'status ' + ok.status);
     check('upstream gets real token', sentAuth === 'Bearer upstream-secret', String(sentAuth));
     const ctype = ok.headers.get('content-type') || '';
@@ -220,13 +217,14 @@ async function main() {
     // Default: no KV write per request, so the 1,000/day free write budget
     // is not consumed by ordinary traffic.
     const kv = makeKV({ 'key:c1': JSON.stringify({ created: Date.now(), requests: 0 }) });
-    const f = makeFetch([['/v2/chat/completions', () => new Response('data: x\n\n', { status: 200 })]]) ;
+    const f = makeFetch([['/v3/config', () => new Response(JSON.stringify({ code: 0, data: { models: [{ id: 'm', credits: 'x0.00' }] } }), { status: 200 })],
+      ['/v2/chat/completions', () => new Response('data: x\n\n', { status: 200 })]]) ;
     const w = await loadWorker(ENV_BASE, f);
-    await w.fetch(req('/v1/chat/completions', { method: 'POST', body: '{}', headers: { authorization: 'Bearer c1' } }), { ...ENV_BASE, KEYS: kv });
+    await w.fetch(req('/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'm' }), headers: { authorization: 'Bearer c1' } }), { ...ENV_BASE, KEYS: kv });
     const idle = JSON.parse(kv._store.get('key:c1'));
     check('usage not counted by default', (idle.requests || 0) === 0, 'requests ' + idle.requests);
 
-    await w.fetch(req('/v1/chat/completions', { method: 'POST', body: '{}', headers: { authorization: 'Bearer c1' } }), { ...ENV_BASE, KEYS: kv, COUNT_USAGE: 'true' });
+    await w.fetch(req('/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'm' }), headers: { authorization: 'Bearer c1' } }), { ...ENV_BASE, KEYS: kv, COUNT_USAGE: 'true' });
     const counted = JSON.parse(kv._store.get('key:c1'));
     check('usage counted when enabled', counted.requests === 1, 'requests ' + counted.requests);
   }
@@ -251,13 +249,14 @@ async function main() {
 
     // Upstream token under an alternate name reaches the backend.
     let seen = null;
-    const f2 = makeFetch([['/v2/chat/completions', (u, i) => {
+    const f2 = makeFetch([['/v3/config', () => new Response(JSON.stringify({ code: 0, data: { models: [{ id: 'm', credits: 'x0.00' }] } }), { status: 200 })],
+      ['/v2/chat/completions', (u, i) => {
       seen = i.headers['Authorization'];
       return new Response('data: x\n\n', { status: 200 });
     }]]);
     const w2 = await loadWorker(ENV_BASE, f2);
     const kv2 = makeKV({ 'key:t': JSON.stringify({ created: Date.now() }) });
-    await w2.fetch(req('/v1/chat/completions', { method: 'POST', body: '{}', headers: { authorization: 'Bearer t' } }), {
+    await w2.fetch(req('/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'm' }), headers: { authorization: 'Bearer t' } }), {
       ENDPOINT: ENV_BASE.ENDPOINT, CLIENT_VERSION: '5.5.2',
       FREE_ONLY: 'true', REQUIRE_KEY: 'true',
       WORKBUDDY_TOKEN: 'alt-upstream', KEYS: kv2,
@@ -271,13 +270,14 @@ async function main() {
     // "404 Route Not Found" from WorkBuddy, which is easy to misread as a
     // routing bug in this Worker, so pin the exact URL.
     let hitUrl = null;
-    const f = makeFetch([['/v2/chat/completions', (u) => {
+    const f = makeFetch([['/v3/config', () => new Response(JSON.stringify({ code: 0, data: { models: [{ id: 'm', credits: 'x0.00' }] } }), { status: 200 })],
+      ['/v2/chat/completions', (u) => {
       hitUrl = String(u);
       return new Response('data: x\n\n', { status: 200 });
     }]]);
     const w = await loadWorker(ENV_BASE, f);
     const kv = makeKV({ 'key:p': JSON.stringify({ created: Date.now() }) });
-    await w.fetch(req('/v1/chat/completions', { method: 'POST', body: '{}', headers: { authorization: 'Bearer p' } }), { ...ENV_BASE, KEYS: kv });
+    await w.fetch(req('/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'm' }), headers: { authorization: 'Bearer p' } }), { ...ENV_BASE, KEYS: kv });
     check('upstream called at /v2', hitUrl === 'https://www.workbuddy.ai/v2/chat/completions', String(hitUrl));
   }
 
@@ -307,13 +307,14 @@ async function main() {
 
     // The stored token is what reaches the upstream.
     let seen = null;
-    const f2 = makeFetch([['/v2/chat/completions', (u, i) => {
+    const f2 = makeFetch([['/v3/config', () => new Response(JSON.stringify({ code: 0, data: { models: [{ id: 'm', credits: 'x0.00' }] } }), { status: 200 })],
+      ['/v2/chat/completions', (u, i) => {
       seen = i.headers['Authorization'];
       return new Response('data: y\n\n', { status: 200 });
     }]]);
     const w2 = await loadWorker(ENV_BASE, f2);
     const kv2 = makeKV({ 'upstream:token': 'stored-token-value-abcdefghij' });
-    await w2.fetch(req('/v1/chat/completions', { method: 'POST', body: '{}', headers: { authorization: 'Bearer k' } }), { ...ENV_BASE, KEYS: kv2, REQUIRE_KEY: 'false' });
+    await w2.fetch(req('/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'm' }), headers: { authorization: 'Bearer k' } }), { ...ENV_BASE, KEYS: kv2, REQUIRE_KEY: 'false' });
     check('stored token used upstream', seen === 'Bearer stored-token-value-abcdefghij', String(seen));
 
     // Junk must be rejected rather than stored.
@@ -372,6 +373,72 @@ async function main() {
     const ls = await w3.fetch(req('/admin/api/login/start', { headers: { authorization: 'Bearer ' + sid } }), { ...ENV_BASE, KEYS: kv });
     const lj = await ls.json();
     check('login start unwraps data.state', ls.status === 200 && lj.state === 's9' && lj.authUrl === 'https://wb/x', JSON.stringify(lj));
+  }
+
+  // ---------------------------------------------------------- free-only safety
+  {
+    const cfg = {
+      code: 0,
+      data: {
+        models: [
+          { id: 'freeA', credits: 'x0.00' },
+          { id: 'paidB', credits: 'x2.00 credits' },
+          { id: 'unratedC', credits: '' },
+        ],
+      },
+    };
+    const mk = () => makeFetch([['/v3/config', () => new Response(JSON.stringify(cfg), { status: 200 })],
+      ['/v2/chat/completions', () => new Response('data: ok\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } })]]);
+    const w = await loadWorker(ENV_BASE, mk());
+    const kv = makeKV({ 'key:z': JSON.stringify({ created: Date.now() }) });
+    const H = { authorization: 'Bearer z' };
+
+    // Listing must contain the free model and nothing else.
+    const lr = await w.fetch(req('/v1/models', { headers: H }), { ...ENV_BASE, KEYS: kv });
+    const ids = (await lr.json()).data.map((m) => m.id);
+    check('free-only lists only free', ids.length === 1 && ids[0] === 'freeA', JSON.stringify(ids));
+
+    // Requesting a paid model directly must be refused: filtering the listing
+    // alone would still let a caller invoke and pay for one.
+    const pr = await w.fetch(req('/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'paidB' }), headers: H }), { ...ENV_BASE, KEYS: kv });
+    check('paid model rejected on chat', pr.status === 403, 'status ' + pr.status);
+    check('paid rejection names the model', (await pr.json()).error.code === 'model_not_free');
+
+    // An unrated model is not free either.
+    const ur = await w.fetch(req('/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'unratedC' }), headers: H }), { ...ENV_BASE, KEYS: kv });
+    check('unrated model rejected on chat', ur.status === 403, 'status ' + ur.status);
+
+    // The free model still goes through.
+    const fr = await w.fetch(req('/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'freeA' }), headers: H }), { ...ENV_BASE, KEYS: kv });
+    check('free model accepted on chat', fr.status === 200, 'status ' + fr.status);
+
+    // Malformed JSON must 400 rather than crash the handler.
+    const br = await w.fetch(req('/v1/chat/completions', { method: 'POST', body: '{not json', headers: H }), { ...ENV_BASE, KEYS: kv });
+    check('malformed body rejected', br.status === 400, 'status ' + br.status);
+
+    // With FREE_ONLY off, paid models pass through.
+    const w2 = await loadWorker(ENV_BASE, mk());
+    const kv2 = makeKV({ 'key:z': JSON.stringify({ created: Date.now() }) });
+    const pr2 = await w2.fetch(req('/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'paidB' }), headers: H }), { ...ENV_BASE, KEYS: kv2, FREE_ONLY: 'false' });
+    check('paid allowed when free-only off', pr2.status === 200, 'status ' + pr2.status);
+  }
+
+  // ------------------------------------------------- no free models => empty
+  {
+    // If nothing is free, the listing must be empty. An earlier version fell
+    // back to serving every model, which would expose paid ones precisely
+    // when a parse failure made the free set look empty.
+    const allPaid = { code: 0, data: { models: [{ id: 'p1', credits: 'x1.00' }, { id: 'p2', credits: 'x2.00' }] } };
+    const f = makeFetch([['/v3/config', () => new Response(JSON.stringify(allPaid), { status: 200 })]]);
+    const w = await loadWorker(ENV_BASE, f);
+    const kv = makeKV({ 'key:z': JSON.stringify({ created: Date.now() }) });
+    const r = await w.fetch(req('/v1/models', { headers: { authorization: 'Bearer z' } }), { ...ENV_BASE, KEYS: kv });
+    const j = await r.json();
+    check('no free models yields empty list', j.data.length === 0, 'count ' + j.data.length);
+
+    const cache = JSON.parse(kv._store.get('models:cache'));
+    check('result records freeOnly flag', cache.freeOnly === true && cache.all === 2 && cache.free === 0);
+    check('result carries an explanatory note', typeof cache.note === 'string' && cache.note.length > 0);
   }
 
   // ---------------------------------------------------------- 404 + CORS
