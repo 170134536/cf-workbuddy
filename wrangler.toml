@@ -12,7 +12,7 @@ keep_vars = true
 # then paste the returned id below.
 [[kv_namespaces]]
 binding = "KEYS"
-id = "PASTE_YOUR_KV_NAMESPACE_ID_HERE"
+id = "890e940c077d49be8d30aa4defc393be"
 
 [vars]
 ENDPOINT = "https://www.workbuddy.ai"

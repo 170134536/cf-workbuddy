@@ -119,7 +119,7 @@ async function main() {
   {
     const kv = makeKV({ 'key:good': JSON.stringify({ created: Date.now(), requests: 0 }) });
     let sentAuth = null;
-    const f = makeFetch([['/v1/chat/completions', (u, i) => {
+    const f = makeFetch([['/v2/chat/completions', (u, i) => {
       sentAuth = i.headers['Authorization'];
       return new Response('data: hi\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } });
     }]]);
@@ -210,7 +210,7 @@ async function main() {
     // Default: no KV write per request, so the 1,000/day free write budget
     // is not consumed by ordinary traffic.
     const kv = makeKV({ 'key:c1': JSON.stringify({ created: Date.now(), requests: 0 }) });
-    const f = makeFetch([['/v1/chat/completions', () => new Response('data: x\n\n', { status: 200 })]]) ;
+    const f = makeFetch([['/v2/chat/completions', () => new Response('data: x\n\n', { status: 200 })]]) ;
     const w = await loadWorker(ENV_BASE, f);
     await w.fetch(req('/v1/chat/completions', { method: 'POST', body: '{}', headers: { authorization: 'Bearer c1' } }), { ...ENV_BASE, KEYS: kv });
     const idle = JSON.parse(kv._store.get('key:c1'));
@@ -241,7 +241,7 @@ async function main() {
 
     // Upstream token under an alternate name reaches the backend.
     let seen = null;
-    const f2 = makeFetch([['/v1/chat/completions', (u, i) => {
+    const f2 = makeFetch([['/v2/chat/completions', (u, i) => {
       seen = i.headers['Authorization'];
       return new Response('data: x\n\n', { status: 200 });
     }]]);
@@ -253,6 +253,22 @@ async function main() {
       WORKBUDDY_TOKEN: 'alt-upstream', KEYS: kv2,
     });
     check('WORKBUDDY_TOKEN fallback used', seen === 'Bearer alt-upstream', String(seen));
+  }
+
+  // ------------------------------------------------- upstream path guard
+  {
+    // The upstream serves completions under /v2. A wrong path returns
+    // "404 Route Not Found" from WorkBuddy, which is easy to misread as a
+    // routing bug in this Worker, so pin the exact URL.
+    let hitUrl = null;
+    const f = makeFetch([['/v2/chat/completions', (u) => {
+      hitUrl = String(u);
+      return new Response('data: x\n\n', { status: 200 });
+    }]]);
+    const w = await loadWorker(ENV_BASE, f);
+    const kv = makeKV({ 'key:p': JSON.stringify({ created: Date.now() }) });
+    await w.fetch(req('/v1/chat/completions', { method: 'POST', body: '{}', headers: { authorization: 'Bearer p' } }), { ...ENV_BASE, KEYS: kv });
+    check('upstream called at /v2', hitUrl === 'https://www.workbuddy.ai/v2/chat/completions', String(hitUrl));
   }
 
   // ---------------------------------------------------------- 404 + CORS

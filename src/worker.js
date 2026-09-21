@@ -223,7 +223,10 @@ async function handleModels(env, force) {
 async function handleChat(req, env) {
   const body = await req.text();
 
-  const upstream = await fetch(`${env.ENDPOINT}/v1/chat/completions`, {
+  // WorkBuddy serves completions under /v2, not /v1. Verified against the
+  // working DSH plugin and confirmed by probing: every /v1 variant returns
+  // 404 Route Not Found from the upstream.
+  const upstream = await fetch(`${env.ENDPOINT}/v2/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',

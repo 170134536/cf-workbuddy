@@ -5,3 +5,7 @@ dist/
 .env
 .env.*
 .dev.vars
+
+# Local one-off helpers that read this machine's WorkBuddy token.
+find-token.mjs
+get-token.mjs
