@@ -14,6 +14,13 @@ keep_vars = true
 binding = "KEYS"
 id = "890e940c077d49be8d30aa4defc393be"
 
+# Serve on the custom domain. A Worker Custom Domain is the cleaner option
+# than a route: Cloudflare issues and renews the certificate automatically and
+# the hostname cannot be claimed by another Worker by accident.
+[[routes]]
+pattern = "kz007.ccwu.cc"
+custom_domain = true
+
 [vars]
 ENDPOINT = "https://www.workbuddy.ai"
 CLIENT_VERSION = "5.5.2"

@@ -48,9 +48,15 @@ function makeFetch(handlers) {
 
 async function loadWorker(env, fetchImpl) {
   globalThis.fetch = fetchImpl;
-  const mod = await import('data:text/javascript;base64,' + Buffer.from(src).toString('base64'));
+  // Cache-bust the data URL. The module map keys on the full URL, so reusing
+  // a constant one returns the first instance forever and a later test would
+  // silently exercise a stale module.
+  const url = 'data:text/javascript;base64,' +
+    Buffer.from(src).toString('base64') + '#t=' + (++loadSeq);
+  const mod = await import(url);
   return mod.default;
 }
+let loadSeq = 0;
 
 function req(path, { method = 'GET', headers = {}, body } = {}) {
   return new Request('https://relay.example.com' + path, {
@@ -82,11 +88,15 @@ async function main() {
   {
     fetchLog = [];
     const cfgModels = {
-      models: [
-        { id: 'free-1', name: 'Free One', credits: 0 },
-        { id: 'paid-1', name: 'Paid One', credits: 1.5 },
-        { id: 'unrated', name: 'Unrated', credits: '' },
-      ],
+      code: 0,
+      msg: 'OK',
+      data: {
+        models: [
+          { id: 'free-1', name: 'Free One', credits: 0 },
+          { id: 'paid-1', name: 'Paid One', credits: 1.5 },
+          { id: 'unrated', name: 'Unrated', credits: '' },
+        ],
+      },
     };
     const kv = makeKV();
     const f = makeFetch([['/v3/config', () => new Response(JSON.stringify(cfgModels), { status: 200 })]]);
@@ -107,7 +117,7 @@ async function main() {
   // ---------------------------------------------------------- free-only edge
   {
     const kv = makeKV({ 'key:k1': JSON.stringify({ created: Date.now(), requests: 0 }) });
-    const cfgAllPaid = { models: [{ id: 'p', name: 'P', credits: 2 }] };
+    const cfgAllPaid = { code: 0, data: { models: [{ id: 'p', name: 'P', credits: 2 }] } };
     const f = makeFetch([['/v3/config', () => new Response(JSON.stringify(cfgAllPaid), { status: 200 })]]);
     const w = await loadWorker(ENV_BASE, f);
     const res = await w.fetch(req('/v1/models', { headers: { authorization: 'Bearer k1' } }), { ...ENV_BASE, KEYS: kv });
@@ -182,7 +192,7 @@ async function main() {
     const w = await loadWorker(ENV_BASE, f);
     const res = await w.fetch(req('/admin'), { ...ENV_BASE, KEYS: makeKV() });
     const html = await res.text();
-    check('admin page renders', res.status === 200 && html.includes('WorkBuddy Relay'), 'status ' + res.status);
+    check('admin page renders', res.status === 200 && html.includes('WorkBuddy 中转'), 'status ' + res.status);
     check('admin page has login handler', html.includes('/admin/api/login'));
   }
 
@@ -190,8 +200,8 @@ async function main() {
   {
     const kv = makeKV();
     const f = makeFetch([
-      ['/v2/plugin/auth/state', () => new Response(JSON.stringify({ state: 'st1', authUrl: 'https://wb.example/login' }), { status: 200 })],
-      ['/v2/plugin/auth/token', () => new Response(JSON.stringify({ code: 11217 }), { status: 200 })],
+      ['/v2/plugin/auth/state', () => new Response(JSON.stringify({ code: 0, data: { state: 'st1', authUrl: 'https://wb.example/login' } }), { status: 200 })]
+      ,['/v2/plugin/auth/token', () => new Response(JSON.stringify({ code: 11217 }), { status: 200 })],
     ]);
     const w = await loadWorker(ENV_BASE, f);
     const lg = await w.fetch(req('/admin/api/login', { method: 'POST', body: JSON.stringify({ password: 'adminpw' }) }), { ...ENV_BASE, KEYS: kv });
@@ -269,6 +279,99 @@ async function main() {
     const kv = makeKV({ 'key:p': JSON.stringify({ created: Date.now() }) });
     await w.fetch(req('/v1/chat/completions', { method: 'POST', body: '{}', headers: { authorization: 'Bearer p' } }), { ...ENV_BASE, KEYS: kv });
     check('upstream called at /v2', hitUrl === 'https://www.workbuddy.ai/v2/chat/completions', String(hitUrl));
+  }
+
+  // ------------------------------------------------- token management
+  {
+    const kv = makeKV();
+    const f = makeFetch([]);
+    const w = await loadWorker(ENV_BASE, f);
+
+    const lg = await w.fetch(req('/admin/api/login', { method: 'POST', body: JSON.stringify({ password: 'adminpw' }) }), { ...ENV_BASE, KEYS: kv });
+    const { token: sid } = await lg.json();
+    const A = { Authorization: 'Bearer ' + sid };
+
+    // Status reflects the secret before anything is stored in KV.
+    const st0 = await w.fetch(req('/admin/api/token', { headers: A }), { ...ENV_BASE, KEYS: kv });
+    const j0 = await st0.json();
+    check('token status falls back to secret', j0.source === '环境变量' && j0.managed === false, JSON.stringify(j0));
+
+    // A token must be stored, and KV must then take precedence.
+    const put = await w.fetch(req('/admin/api/token', { method: 'POST', headers: A, body: JSON.stringify({ token: 'x'.repeat(40) }) }), { ...ENV_BASE, KEYS: kv });
+    const jp = await put.json();
+    check('token saved to KV', jp.ok === true, JSON.stringify(jp));
+
+    const st1 = await w.fetch(req('/admin/api/token', { headers: A }), { ...ENV_BASE, KEYS: kv });
+    const j1 = await st1.json();
+    check('KV token overrides secret', j1.managed === true && j1.length === 40, JSON.stringify(j1));
+
+    // The stored token is what reaches the upstream.
+    let seen = null;
+    const f2 = makeFetch([['/v2/chat/completions', (u, i) => {
+      seen = i.headers['Authorization'];
+      return new Response('data: y\n\n', { status: 200 });
+    }]]);
+    const w2 = await loadWorker(ENV_BASE, f2);
+    const kv2 = makeKV({ 'upstream:token': 'stored-token-value-abcdefghij' });
+    await w2.fetch(req('/v1/chat/completions', { method: 'POST', body: '{}', headers: { authorization: 'Bearer k' } }), { ...ENV_BASE, KEYS: kv2, REQUIRE_KEY: 'false' });
+    check('stored token used upstream', seen === 'Bearer stored-token-value-abcdefghij', String(seen));
+
+    // Junk must be rejected rather than stored.
+    const bad = await w.fetch(req('/admin/api/token', { method: 'POST', headers: A, body: JSON.stringify({ token: 'short' }) }), { ...ENV_BASE, KEYS: kv });
+    check('rejects too-short token', bad.status === 400, 'status ' + bad.status);
+
+    // Saving a token must invalidate the cached model list. The session here
+    // must be minted against kv3: a session from another KV is not valid, and
+    // reusing one would make this pass for the wrong reason.
+    const kv3 = makeKV({ 'models:cache': JSON.stringify({ at: Date.now(), exposed: [] }) });
+    const w3 = await loadWorker(ENV_BASE, makeFetch([]));
+    const lg3 = await w3.fetch(req('/admin/api/login', { method: 'POST', body: JSON.stringify({ password: 'adminpw' }) }), { ...ENV_BASE, KEYS: kv3 });
+    const { token: sid3 } = await lg3.json();
+    const A3 = { Authorization: 'Bearer ' + sid3 };
+
+    const save3 = await w3.fetch(req('/admin/api/token', { method: 'POST', headers: A3, body: JSON.stringify({ token: 'y'.repeat(40) }) }), { ...ENV_BASE, KEYS: kv3 });
+    check('token save accepted with own session', (await save3.json()).ok === true);
+
+    const stc = await w3.fetch(req('/admin/api/token', { headers: A3 }), { ...ENV_BASE, KEYS: kv3 });
+    check('token endpoints gated by session', (await w3.fetch(req('/admin/api/token'), { ...ENV_BASE, KEYS: kv3 })).status === 401);
+    check('token status readable after save', (await stc.json()).managed === true);
+    check('model cache cleared on save', kv3._store.get('models:cache') === undefined);
+  }
+
+  // ------------------------------------------------- upstream envelope shape
+  {
+    // WorkBuddy wraps every response as {code,msg,requestId,data}. Reading the
+    // payload from the top level silently yields nothing while looking
+    // successful, so pin both shapes here.
+    let sawAuth = null;
+    const f = makeFetch([['/v3/config', (u, i) => {
+      sawAuth = i.headers['Authorization'];
+      return new Response(JSON.stringify({ code: 0, data: { models: [{ id: 'm1', credits: 0 }] } }), { status: 200 });
+    }]]);
+    const w = await loadWorker(ENV_BASE, f);
+    const kv = makeKV({ 'key:k': JSON.stringify({ created: Date.now() }) });
+    const r = await w.fetch(req('/v1/models', { headers: { authorization: 'Bearer k' } }), { ...ENV_BASE, KEYS: kv });
+    const j = await r.json();
+    check('models read from data envelope', j.data.length === 1 && j.data[0].id === 'm1', JSON.stringify(j.data));
+    check('catalogue call carries token', sawAuth === 'Bearer upstream-secret', String(sawAuth));
+
+    // A bare (un-enveloped) body must still work, so an upstream change in
+    // either direction does not break the listing. Fresh KV, otherwise the
+    // cached list from the check above is served and nothing is fetched.
+    const f2 = makeFetch([['/v3/config', () => new Response(JSON.stringify({ models: [{ id: 'bare', credits: 0 }] }), { status: 200 })]]);
+    const w2 = await loadWorker(ENV_BASE, f2);
+    const kv2 = makeKV({ 'key:k': JSON.stringify({ created: Date.now() }) });
+    const r2 = await w2.fetch(req('/v1/models', { headers: { authorization: 'Bearer k' } }), { ...ENV_BASE, KEYS: kv2 });
+    check('bare response also accepted', (await r2.json()).data[0].id === 'bare');
+
+    // login/start must unwrap data.state too.
+    const f3 = makeFetch([['/v2/plugin/auth/state', () => new Response(JSON.stringify({ code: 0, data: { state: 's9', authUrl: 'https://wb/x' } }), { status: 200 })]]);
+    const w3 = await loadWorker(ENV_BASE, f3);
+    const lg = await w3.fetch(req('/admin/api/login', { method: 'POST', body: JSON.stringify({ password: 'adminpw' }) }), { ...ENV_BASE, KEYS: kv });
+    const sid = (await lg.json()).token;
+    const ls = await w3.fetch(req('/admin/api/login/start', { headers: { authorization: 'Bearer ' + sid } }), { ...ENV_BASE, KEYS: kv });
+    const lj = await ls.json();
+    check('login start unwraps data.state', ls.status === 200 && lj.state === 's9' && lj.authUrl === 'https://wb/x', JSON.stringify(lj));
   }
 
   // ---------------------------------------------------------- 404 + CORS
