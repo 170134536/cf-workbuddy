@@ -56,17 +56,62 @@ function json(data, status = 200, headers = {}) {
 //
 // Several secret spellings are accepted so an operator who set a differently
 // named variable is not silently ignored.
-// Memoised for the isolate's lifetime. The token is a JWT valid until 2027,
-// so re-reading KV on every request costs latency on the hot path and buys
-// nothing. Cleared explicitly when the admin page stores a new token.
-let tokenCache = null;
+//
+// Tokens now live as a list so multiple credentials can be rotated, which is
+// how the "请求过于频繁，请稍后重试" limit is worked around: when the
+// upstream answers 429/403 or the connection drops, the next token is tried.
+// Memoised for the isolate's lifetime — the JWTs are valid for a year, so
+// re-reading KV per request costs latency and buys nothing. Cleared when the
+// admin page adds or removes a token.
+let poolCache = null;
+let rrIndex = 0; // round-robin cursor, monotonic within the isolate
 
+/**
+ * The full credential list: KV-managed tokens plus the secret fallback.
+ * Falls back to the legacy single-value key so existing installs keep
+ * working, and to the environment secret when nothing is stored.
+ */
+async function tokenPool(env) {
+  if (poolCache) return poolCache;
+
+  let list = null;
+  try {
+    const raw = await env.KEYS.get('upstream:tokens');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length) list = parsed;
+    }
+  } catch {
+    list = null;
+  }
+
+  if (!list) {
+    // Legacy single token, kept for compatibility with pre-rotation installs.
+    const stored = await env.KEYS.get('upstream:token', 'json');
+    if (stored && stored.token) list = [{ ...stored }];
+  }
+
+  if (!list) {
+    const secret = env.UPSTREAM_TOKEN || env.WORKBUDDY_TOKEN || env.TOKEN || '';
+    if (secret) list = [{ token: secret, source: '环境变量', at: null }];
+  }
+
+  poolCache = list || [];
+  return poolCache;
+}
+
+/** Round-robin pick. Returns {token, index} or null when empty. */
+async function nextToken(env) {
+  const pool = await tokenPool(env);
+  if (!pool.length) return null;
+  const i = rrIndex++ % pool.length;
+  return { token: pool[i].token, index: i, entry: pool[i] };
+}
+
+/** The first credential, for single-token callers (catalogue fetch, verify). */
 async function upstreamToken(env) {
-  if (tokenCache) return tokenCache;
-  const stored = await env.KEYS.get('upstream:token');
-  const value = stored || env.UPSTREAM_TOKEN || env.WORKBUDDY_TOKEN || env.TOKEN || '';
-  if (value) tokenCache = value;
-  return value;
+  const pick = await nextToken(env);
+  return pick ? pick.token : '';
 }
 
 function adminPassword(env) {
@@ -352,27 +397,63 @@ async function handleChat(req, env) {
   // working DSH plugin and confirmed by probing: every /v1 variant returns
   // 404 Route Not Found from the upstream.
   //
-  // The cross-border path to the upstream drops connections occasionally
-  // (ECONNRESET, ~4% measured). A dropped connection surfaces to the client
-  // as "retry and it works", so retry once here when the fetch itself fails
-  // — not when an HTTP status comes back, which means the request was
-  // received and answered.
+  // Cross-border drops and per-credential rate limits are real (measured ~4%
+  // ECONNRESET; "请求过于频繁" 429s are why multiple tokens exist), so the
+  // request is attempted against each credential in the pool until one
+  // actually answers. Only connection failures and 429/403 from the upstream
+  // rotate; an answered HTTP status — even 500 — is returned as-is, because
+  // the model may have started generating.
   const endpoint = `${env.ENDPOINT}/v2/chat/completions`;
-  const headers = {
+  const baseHeaders = {
     'Content-Type': 'application/json',
     'Accept': 'text/event-stream',
     'User-Agent': ua(env),
-    'Authorization': `Bearer ${await upstreamToken(env)}`,
   };
 
+  const pool = await tokenPool(env);
+  if (!pool.length) {
+    return json({ error: { message: '未配置上游凭证', type: 'server_error' } }, 503);
+  }
+
+  const started = new Set();
   let upstream;
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  let lastRotatable = false; // last answer was 429/403, safe to rotate away
+  let lastError = null;
+
+  for (let attempt = 0; attempt < pool.length * 2; attempt++) {
+    const pick = await nextToken(env);
+    if (started.has(pick.index)) break; // every credential tried once
+    started.add(pick.index);
+
     try {
-      upstream = await fetch(endpoint, { method: 'POST', headers, body });
-      break;
+      upstream = await fetch(endpoint, {
+        method: 'POST',
+        headers: { ...baseHeaders, Authorization: `Bearer ${pick.token}` },
+        body,
+      });
+
+      const rotatable = upstream.status === 429 || upstream.status === 403;
+      lastRotatable = rotatable;
+      if (!rotatable) break;
+      lastError = upstream.status;
+      // Drain the body so the socket is reusable before rotating.
+      await upstream.body?.cancel?.().catch(() => {});
     } catch (e) {
-      if (attempt === 2) throw e;
+      lastError = e;
+      lastRotatable = false;
+      // connection failure — rotate to the next credential
     }
+  }
+
+  // Every credential was tried and every answer was rotatable (or every
+  // connection failed). The last response's body has been consumed, so it
+  // cannot be relayed — answer with a clear error instead.
+  if (!upstream || lastRotatable) {
+    const msg = lastRotatable
+      ? `上游限流（HTTP ${lastError}），已尝试全部凭证仍被拒绝`
+      : '上游连接失败，已尝试全部凭证';
+    const status = lastRotatable ? lastError : 502;
+    return json({ error: { message: msg, type: 'upstream_error' } }, status);
   }
 
   return new Response(upstream.body, {
@@ -493,14 +574,47 @@ function decodeExp(token) {
 }
 
 /** Persist a token so the admin UI can refresh it without a redeploy. */
-async function saveToken(env, token, source) {
+async function saveToken(env, token, source, name = '') {
   const expires = decodeExp(token);
-  const rec = JSON.stringify({ token, expires, source, at: Date.now() });
-  await env.KEYS.put('upstream:token', rec);
-  tokenCache = null; // drop the memoised value so the next request re-reads
+  const pool = await tokenPool(env);
+  // Avoid duplicate entries: saving the same credential twice is a mistake,
+  // not a second account.
+  const dup = pool.find((e) => e.token === token);
+  if (dup) {
+    dup.source = source;
+    if (name) dup.name = name;
+    dup.at = Date.now();
+  } else {
+    pool.push({ token, expires, source, name, at: Date.now() });
+  }
+  await env.KEYS.put('upstream:tokens', JSON.stringify(pool));
+  // The legacy key is superseded; drop it so the fallback never resurrects
+  // an old single token next to the list.
+  await env.KEYS.delete('upstream:token');
+  poolCache = null; // drop the memoised list so the next request re-reads
   await env.KEYS.delete('models:cache');
   await env.KEYS.delete('free:ids');
-  return { expires, source, at: Date.now() };
+  return { expires, source, name, at: Date.now(), total: pool.length };
+}
+
+/** Remove one credential by its position in the pool. */
+async function removeToken(env, index) {
+  const pool = await tokenPool(env);
+  const i = Number(index);
+  if (!(i >= 0) || i >= pool.length) {
+    return json({ error: '凭证序号无效' }, 400);
+  }
+  const removed = pool.splice(i, 1)[0];
+  if (pool.length) {
+    await env.KEYS.put('upstream:tokens', JSON.stringify(pool));
+  } else {
+    // Last credential gone; clear the key so the secret fallback takes over.
+    await env.KEYS.delete('upstream:tokens');
+  }
+  poolCache = null;
+  await env.KEYS.delete('models:cache');
+  await env.KEYS.delete('free:ids');
+  return json({ ok: true, removed: removed.source || '凭证', total: pool.length });
 }
 
 async function loginPoll(env, state) {
@@ -521,27 +635,37 @@ async function loginPoll(env, state) {
 
 /** Accept a token pasted by the operator. */
 async function putToken(req, env) {
-  const { token } = await req.json().catch(() => ({}));
+  const { token, name } = await req.json().catch(() => ({}));
   if (!token || typeof token !== 'string' || token.length < 20) {
     return json({ error: 'token 无效' }, 400);
   }
-  const saved = await saveToken(env, token.trim(), '手动填写');
+  const saved = await saveToken(env, token.trim(), '手动填写', typeof name === 'string' ? name.trim() : '');
   return json({ ok: true, ...saved });
 }
 
-/** Report which token is active and where it came from. */
+/** Drop one credential from the pool. */
+async function deleteToken(req, env) {
+  const { index } = await req.json().catch(() => ({}));
+  return removeToken(env, index);
+}
+
+/** Report the credential pool: how many, sources, and masks. */
 async function tokenStatus(env) {
-  const stored = await env.KEYS.get('upstream:token', 'json');
+  const pool = await tokenPool(env);
   const secret = env.UPSTREAM_TOKEN || env.WORKBUDDY_TOKEN || env.TOKEN || '';
-  const active = stored ? stored.token : secret;
 
   return json({
-    source: stored ? stored.source : (secret ? '环境变量' : '未配置'),
-    managed: !!stored,
-    setAt: stored ? stored.at : null,
-    expires: stored ? stored.expires : (active ? decodeExp(active) : null),
-    length: active ? active.length : 0,
-    preview: active ? active.slice(0, 8) + '...' + active.slice(-6) : '',
+    total: pool.length,
+    secretConfigured: !!secret,
+    entries: pool.map((e) => ({
+      index: pool.indexOf(e),
+      source: e.source || '未知',
+      name: e.name || '',
+      setAt: e.at || null,
+      expires: e.expires || (e.token ? decodeExp(e.token) : null),
+      length: e.token ? e.token.length : 0,
+      preview: e.token ? e.token.slice(0, 8) + '...' + e.token.slice(-6) : '',
+    })),
   });
 }
 
@@ -636,6 +760,9 @@ const ADMIN_HTML = `<!doctype html>
   .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;font-size:13px;margin-top:12px}
   .kv dt{color:#6a737d}
   .kv dd{margin:0;word-break:break-all}
+  .tok-row{display:flex;gap:10px;align-items:center;padding:10px 0;border-top:1px solid #eaeef2}
+  .tok-row:first-child{border-top:none}
+  .danger{color:#d1242f!important;border-color:#d1242f}
   .steps{font-size:13px;color:#57606a;margin:10px 0 0;padding-left:20px;line-height:1.9}
   .steps li{margin:0}
   .hide{display:none!important}
@@ -659,14 +786,11 @@ const ADMIN_HTML = `<!doctype html>
     <div class="card">
       <h2>上游凭证 <span class="tag" id="tok-tag">读取中</span></h2>
       <div class="sub" style="margin:0">
-        中转调用 WorkBuddy 所用的登录凭证。凭证过期后模型列表和对话都会失败，在此更新即可，<b>无需重新部署</b>。
+        中转调用 WorkBuddy 所用的登录凭证，<b>支持多个凭证轮换使用</b>：调用时依次轮换，
+        某个凭证被限流（「请求过于频繁」）或失效时自动换下一个，全部失败才报错。
+        凭证过期后模型列表和对话都会失败，在此更新即可，<b>无需重新部署</b>。
       </div>
-      <dl class="kv">
-        <dt>来源</dt><dd id="tok-src">—</dd>
-        <dt>凭证</dt><dd><code id="tok-prev">—</code></dd>
-        <dt>有效期至</dt><dd id="tok-exp">—</dd>
-        <dt>更新时间</dt><dd id="tok-at">—</dd>
-      </dl>
+      <div id="tok-list"></div>
       <div class="row">
         <button class="sec" onclick="verifyToken()" id="verify-btn">检测凭证</button>
         <button class="sec" onclick="startLogin()" id="wblogin-btn">用 WorkBuddy 账号登录</button>
@@ -687,9 +811,15 @@ const ADMIN_HTML = `<!doctype html>
         </div>
       </div>
 
-      <label for="manual-tok">或手动填写凭证</label>
-      <input id="manual-tok" placeholder="粘贴 WorkBuddy access token" autocomplete="off">
-      <button onclick="saveManual()">保存凭证</button>
+      <label for="manual-tok">添加凭证（可粘贴多个，每行一个，自动加入轮换池）</label>
+      <input id="manual-tok" placeholder="粘贴 WorkBuddy access token（每行一个）" autocomplete="off">
+      <div class="row" style="margin-top:8px">
+        <div class="grow">
+          <label for="manual-name">备注（可选）</label>
+          <input id="manual-name" placeholder="例如：账号 A / 小号 2" autocomplete="off">
+        </div>
+      </div>
+      <button onclick="saveManual()">添加凭证</button>
     </div>
 
     <div class="card">
@@ -810,15 +940,58 @@ function loadToken() {
     .then(function (r) { return r.json(); })
     .then(function (j) {
       var tag = document.getElementById('tok-tag');
-      document.getElementById('tok-src').textContent = j.source || '—';
-      document.getElementById('tok-prev').textContent = j.preview || '（未配置）';
-      var left = before(j.expires);
-      document.getElementById('tok-exp').textContent = j.expires
-        ? fmtTime(j.expires) + (left !== null ? '（' + (left > 0 ? '剩余 ' + left + ' 天' : '已过期') + '）' : '')
-        : '未知';
-      document.getElementById('tok-at').textContent = fmtTime(j.setAt);
-      tag.textContent = j.preview ? (left !== null && left < 0 ? '已过期' : '已配置') : '未配置';
-      tag.className = 'tag ' + (j.preview ? (left !== null && left < 0 ? 'err' : 'ok') : 'warn');
+      var list = document.getElementById('tok-list');
+      list.innerHTML = '';
+      var entries = j.entries || [];
+      tag.textContent = entries.length ? entries.length + ' 个凭证' : '未配置';
+      tag.className = 'tag ' + (entries.length ? 'ok' : 'warn');
+
+      if (!entries.length) {
+        var empty = document.createElement('div');
+        empty.className = 'hint';
+        empty.textContent = j.secretConfigured ? '使用环境变量中的凭证（不在列表中显示）' : '尚未配置凭证';
+        list.appendChild(empty);
+        return;
+      }
+
+      entries.forEach(function (e) {
+        var row = document.createElement('div');
+        row.className = 'tok-row';
+        var left = before(e.expires);
+        var leftTxt = e.expires
+          ? (left !== null ? (left > 0 ? '剩余 ' + left + ' 天' : '已过期') : '')
+          : '';
+        row.innerHTML =
+          '<div class="grow">' +
+            '<div><code>' + esc(e.preview || '—') + '</code> ' +
+              (e.name ? '<b>' + esc(e.name) + '</b>' : '') +
+              '<span class="tag ' + (left !== null && left < 0 ? 'err' : 'ok') + '">' +
+                esc(e.source || '') + '</span></div>' +
+            '<div class="sub" style="margin:4px 0 0">' +
+              '添加于 ' + esc(fmtTime(e.setAt)) +
+              (e.expires ? ' · 有效期至 ' + esc(fmtTime(e.expires)) + ' ' + esc(leftTxt) : '') +
+            '</div>' +
+          '</div>' +
+          '<button class="sec danger" onclick="removeTokenEntry(' + e.index + ')">删除</button>';
+        list.appendChild(row);
+      });
+    });
+}
+
+function removeTokenEntry(index) {
+  if (!confirm('确定删除该凭证？删除后轮换池将少一个可用凭证。')) return;
+  fetch('/admin/api/token/delete', {
+    method: 'POST',
+    headers: Hj(),
+    body: JSON.stringify({ index: index }),
+  })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      show('tok-msg', j.ok ? 'ok' : 'err', j.ok ? '✓ 已删除' : esc(j.error || '删除失败'));
+      if (j.ok) loadToken();
+    })
+    .catch(function (e) {
+      show('tok-msg', 'err', '请求失败：' + esc(e.message));
     });
 }
 
@@ -896,20 +1069,35 @@ function cancelLogin() {
 }
 
 function saveManual() {
-  var v = document.getElementById('manual-tok').value.trim();
-  if (!v) return;
-  fetch('/admin/api/token', { method: 'POST', headers: Hj(), body: JSON.stringify({ token: v }) })
-    .then(function (r) { return r.json(); })
-    .then(function (j) {
-      if (j.ok) {
-        document.getElementById('manual-tok').value = '';
-        show('tok-msg', 'ok', '✓ 凭证已保存。' +
-          (j.expires ? '有效期至 ' + fmtTime(j.expires) : ''));
-        loadToken();
-      } else {
-        show('tok-msg', 'err', esc(j.error || '保存失败'));
-      }
+  var raw = document.getElementById('manual-tok').value.trim();
+  if (!raw) return;
+  var name = document.getElementById('manual-name').value.trim();
+  // Support several tokens at once, one per line: all join the rotation pool.
+  var tokens = raw.split(/\r?\n/).map(function (s) { return s.trim(); }).filter(Boolean);
+  if (!tokens.length) return;
+
+  var box = show('tok-msg', 'info', '正在添加 ' + tokens.length + ' 个凭证…');
+  var done = 0, failed = 0;
+  var chain = Promise.resolve();
+  tokens.forEach(function (t) {
+    chain = chain.then(function () {
+      return fetch('/admin/api/token', {
+        method: 'POST',
+        headers: Hj(),
+        body: JSON.stringify({ token: t, name: name }),
+      }).then(function (r) { return r.json(); }).then(function (j) {
+        if (j.ok) done++; else failed++;
+      }).catch(function () { failed++; });
     });
+  });
+  chain.then(function () {
+    var msg = '✓ 已添加 ' + done + ' 个凭证，轮换池共 ' + done + ' 个。' +
+      (failed ? ' ' + failed + ' 个失败（可能是重复或格式错误）。' : '');
+    show('tok-msg', done ? 'ok' : 'err', msg);
+    document.getElementById('manual-tok').value = '';
+    document.getElementById('manual-name').value = '';
+    loadToken();
+  });
 }
 
 function loadKeys() {
@@ -1014,6 +1202,7 @@ export default {
       if (p === '/admin/api/keys/delete') return deleteKey(req, env);
       if (p === '/admin/api/token' && req.method === 'GET') return tokenStatus(env);
       if (p === '/admin/api/token' && req.method === 'POST') return putToken(req, env);
+      if (p === '/admin/api/token/delete') return deleteToken(req, env);
       if (p === '/admin/api/token/verify') return tokenVerify(env);
       if (p === '/admin/api/login/start') return loginStart(env);
       if (p === '/admin/api/login/poll') {

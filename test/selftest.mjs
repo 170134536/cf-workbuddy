@@ -294,7 +294,9 @@ async function main() {
     // Status reflects the secret before anything is stored in KV.
     const st0 = await w.fetch(req('/admin/api/token', { headers: A }), { ...ENV_BASE, KEYS: kv });
     const j0 = await st0.json();
-    check('token status falls back to secret', j0.source === '环境变量' && j0.managed === false, JSON.stringify(j0));
+    check('token status falls back to secret',
+      j0.total === 1 && j0.entries[0].source === '环境变量' && j0.secretConfigured === true,
+      JSON.stringify(j0));
 
     // A token must be stored, and KV must then take precedence.
     const put = await w.fetch(req('/admin/api/token', { method: 'POST', headers: A, body: JSON.stringify({ token: 'x'.repeat(40) }) }), { ...ENV_BASE, KEYS: kv });
@@ -303,7 +305,7 @@ async function main() {
 
     const st1 = await w.fetch(req('/admin/api/token', { headers: A }), { ...ENV_BASE, KEYS: kv });
     const j1 = await st1.json();
-    check('KV token overrides secret', j1.managed === true && j1.length === 40, JSON.stringify(j1));
+    check('KV token overrides secret', j1.total === 2 && j1.entries[1].length === 40, JSON.stringify(j1));
 
     // The stored token is what reaches the upstream.
     let seen = null;
@@ -313,7 +315,7 @@ async function main() {
       return new Response('data: y\n\n', { status: 200 });
     }]]);
     const w2 = await loadWorker(ENV_BASE, f2);
-    const kv2 = makeKV({ 'upstream:token': 'stored-token-value-abcdefghij' });
+    const kv2 = makeKV({ 'upstream:token': JSON.stringify({ token: 'stored-token-value-abcdefghij', source: '旧版单值' }) });
     await w2.fetch(req('/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'm' }), headers: { authorization: 'Bearer k' } }), { ...ENV_BASE, KEYS: kv2, REQUIRE_KEY: 'false' });
     check('stored token used upstream', seen === 'Bearer stored-token-value-abcdefghij', String(seen));
 
@@ -335,8 +337,60 @@ async function main() {
 
     const stc = await w3.fetch(req('/admin/api/token', { headers: A3 }), { ...ENV_BASE, KEYS: kv3 });
     check('token endpoints gated by session', (await w3.fetch(req('/admin/api/token'), { ...ENV_BASE, KEYS: kv3 })).status === 401);
-    check('token status readable after save', (await stc.json()).managed === true);
+    check('token status readable after save', (await stc.json()).entries.length >= 1);
     check('model cache cleared on save', kv3._store.get('models:cache') === undefined);
+  }
+
+  // ------------------------------------------------- token rotation on 429
+  {
+    // The whole point of multiple credentials: when the upstream answers 429
+    // (「请求过于频繁」) or drops the connection, the next token is tried
+    // and the client gets the successful answer instead of an error.
+    const kv = makeKV({ 'key:r': JSON.stringify({ created: Date.now() }) });
+    const seen = [];
+    const rateLimited = (u, i) => {
+      seen.push(i.headers['Authorization']);
+      const n = seen.length;
+      // First credential rate-limited, second answers, third never reached.
+      const code = n === 1 ? 429 : n === 2 ? 200 : 500;
+      return new Response(code === 200 ? 'data: ok\n\n' : 'rate limited', {
+        status: code,
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    };
+
+    // Seed two stored tokens, then rotate: the 429 must retry with token B.
+    const w = await loadWorker(ENV_BASE, makeFetch([['/v2/chat/completions', rateLimited]]));
+    const tokens = JSON.stringify([
+      { token: 'token-a-aaaaaaaaaaaaaaaa', source: '手动填写', at: Date.now() },
+      { token: 'token-b-bbbbbbbbbbbbbbbb', source: '手动填写', at: Date.now() },
+    ]);
+    const kvr = makeKV({ 'key:r': JSON.stringify({ created: Date.now() }), 'upstream:tokens': tokens, 'free:ids': JSON.stringify(['m']) });
+    const res = await w.fetch(req('/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'm' }), headers: { authorization: 'Bearer r' } }), { ...ENV_BASE, KEYS: kvr, REQUIRE_KEY: 'false' });
+    check('429 rotates to next credential', res.status === 200, 'status ' + res.status);
+    check('first attempt used token A', seen[0] === 'Bearer token-a-aaaaaaaaaaaaaaaa', String(seen[0]));
+    check('second attempt used token B', seen[1] === 'Bearer token-b-bbbbbbbbbbbbbbbb', String(seen[1]));
+
+    // All credentials rate-limited -> the 429 is what the client sees.
+    const kv429 = makeKV({ 'key:r': JSON.stringify({ created: Date.now() }), 'upstream:tokens': tokens, 'free:ids': JSON.stringify(['m']) });
+    const seen2 = [];
+    const w2 = await loadWorker(ENV_BASE, makeFetch([['/v2/chat/completions', (u, i) => {
+      seen2.push(i.headers['Authorization']);
+      return new Response('limited', { status: 429 });
+    }]]));
+    const res2 = await w2.fetch(req('/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'm' }), headers: { authorization: 'Bearer r' } }), { ...ENV_BASE, KEYS: kv429, REQUIRE_KEY: 'false' });
+    check('all limited returns 429', res2.status === 429, 'status ' + res2.status);
+    check('both credentials were tried', seen2.length === 2, 'tries ' + seen2.length);
+
+    // Delete one credential leaves the other intact.
+    const kvDel = makeKV({ 'key:r': JSON.stringify({ created: Date.now() }), 'upstream:tokens': tokens });
+    const w3 = await loadWorker(ENV_BASE, makeFetch([]));
+    const lg3 = await w3.fetch(req('/admin/api/login', { method: 'POST', body: JSON.stringify({ password: 'adminpw' }) }), { ...ENV_BASE, KEYS: kvDel });
+    const { token: sid3 } = await lg3.json();
+    const del = await w3.fetch(req('/admin/api/token/delete', { method: 'POST', headers: { Authorization: 'Bearer ' + sid3 }, body: JSON.stringify({ index: 1 }) }), { ...ENV_BASE, KEYS: kvDel });
+    check('delete credential works', (await del.json()).ok === true);
+    const left = JSON.parse(kvDel._store.get('upstream:tokens'));
+    check('only one credential remains', left.length === 1 && left[0].token === 'token-a-aaaaaaaaaaaaaaaa', JSON.stringify(left.map((e) => e.token)));
   }
 
   // ------------------------------------------------- upstream envelope shape
