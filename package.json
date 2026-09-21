@@ -1,0 +1,16 @@
+{
+  "name": "cf-workbuddy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker that relays WorkBuddy models over an OpenAI-compatible API with per-key access control",
+  "main": "src/worker.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node test/selftest.mjs",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

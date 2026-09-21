@@ -1,0 +1,28 @@
+name = "cf-workbuddy"
+main = "src/worker.js"
+compatibility_date = "2026-09-20"
+
+# KV holds API keys and the model cache. Create it once with:
+#   npx wrangler kv namespace create KEYS
+# then paste the returned id below.
+[[kv_namespaces]]
+binding = "KEYS"
+id = "PASTE_YOUR_KV_NAMESPACE_ID_HERE"
+
+[vars]
+ENDPOINT = "https://www.workbuddy.ai"
+CLIENT_VERSION = "5.5.2"
+
+# Expose only the models that are currently free.
+FREE_ONLY = "true"
+
+# Require a generated API key on /v1/chat/completions and /v1/models.
+REQUIRE_KEY = "true"
+
+# Record per-key usage. Off by default: the free KV tier allows 1,000 writes
+# per day, so counting every request would exhaust the quota and then fail.
+COUNT_USAGE = "false"
+
+# Secrets are set separately, never committed:
+#   npx wrangler secret put UPSTREAM_TOKEN
+#   npx wrangler secret put ADMIN_PASSWORD
