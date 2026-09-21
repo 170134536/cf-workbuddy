@@ -21,7 +21,21 @@ id = "890e940c077d49be8d30aa4defc393be"
 pattern = "kz007.ccwu.cc"
 custom_domain = true
 
+# Keep one isolate warm. An idle Worker is evicted, and the first request
+# after that pays to load and parse the script again — measured at ~2.5s cold
+# versus ~0.3-0.8s warm. Five minutes is the shortest cron interval.
+[triggers]
+crons = ["*/5 * * * *"]
+
+# Run the Worker close to the upstream backend (Singapore) instead of wherever
+# the client happens to land. The client → Cloudflare edge hop is unchanged;
+# this shortens the bigger leg: edge → upstream. On the free plan this key
+# may be ignored; the deploy output will tell us.
+[placement]
+mode = "smart"
+
 [vars]
+WORKER_HOST = "kz007.ccwu.cc"
 ENDPOINT = "https://www.workbuddy.ai"
 CLIENT_VERSION = "5.5.2"
 

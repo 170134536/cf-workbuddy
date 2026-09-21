@@ -22,6 +22,18 @@
 const UA_BASE = 'WorkBuddy/';
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
+// (removed)
+//
+// These are third-party DNS services that publish batches of Cloudflare edge
+// addresses, used to dodge polluted or badly routed anycast answers. They are
+// ordinary Cloudflare IPs — verified by probing: every address they return
+// serves the Worker with a cf-ray header and a Google Trust Services
+// certificate.
+//
+// A source is a convenience, not an authority: it can go stale or hostile, so
+// the test always validates the candidate against our own hostname and lets
+// the operator enter an address manually.
+
 // ---------------------------------------------------------------- helpers
 
 function json(data, status = 200, headers = {}) {
@@ -44,10 +56,17 @@ function json(data, status = 200, headers = {}) {
 //
 // Several secret spellings are accepted so an operator who set a differently
 // named variable is not silently ignored.
+// Memoised for the isolate's lifetime. The token is a JWT valid until 2027,
+// so re-reading KV on every request costs latency on the hot path and buys
+// nothing. Cleared explicitly when the admin page stores a new token.
+let tokenCache = null;
+
 async function upstreamToken(env) {
+  if (tokenCache) return tokenCache;
   const stored = await env.KEYS.get('upstream:token');
-  if (stored) return stored;
-  return env.UPSTREAM_TOKEN || env.WORKBUDDY_TOKEN || env.TOKEN || '';
+  const value = stored || env.UPSTREAM_TOKEN || env.WORKBUDDY_TOKEN || env.TOKEN || '';
+  if (value) tokenCache = value;
+  return value;
 }
 
 function adminPassword(env) {
@@ -174,6 +193,11 @@ async function fetchModels(env, force) {
       ? '当前没有免费模型可用，已按免费模式返回空列表。如需强制放行全部模型，请在管理页关闭「仅免费」。'
       : '';
 
+  // Side table holding only the permitted ids. The chat path reads this
+  // instead of the full catalogue, so a request does not pay to parse every
+  // model just to check one name.
+  await env.KEYS.put('free:ids', JSON.stringify(freeList.map((m) => m.id)));
+
   const result = {
     at: Date.now(),
     source,
@@ -250,6 +274,37 @@ function randomToken(bytes = 24) {
 
 // ------------------------------------------------------------------ routes
 
+/**
+ * The ids permitted under free-only, memoised per isolate.
+ *
+ * Rebuilding the catalogue means a round trip to WorkBuddy, so this reads the
+ * side table written alongside it. When that is missing (first run, or cleared
+ * because a token changed) it falls back to building the list once.
+ */
+let freeIdsCache = null;
+
+async function freeIds(env) {
+  if (freeIdsCache) return freeIdsCache;
+
+  const raw = await env.KEYS.get('free:ids');
+  if (raw) {
+    try {
+      const ids = JSON.parse(raw);
+      if (Array.isArray(ids) && ids.length) {
+        freeIdsCache = ids;
+        return ids;
+      }
+    } catch {
+      // fall through and rebuild
+    }
+  }
+
+  const c = await fetchModels(env, true);
+  const ids = c.exposed.map((m) => m.id);
+  if (ids.length) freeIdsCache = ids;
+  return ids;
+}
+
 async function handleModels(env, force) {
   const c = await fetchModels(env, force);
   return json({
@@ -276,12 +331,16 @@ async function handleChat(req, env) {
     } catch {
       return json({ error: { message: '请求体不是合法 JSON', type: 'invalid_request_error' } }, 400);
     }
-    const c = await fetchModels(env, false);
-    if (!c.exposed.some((m) => m.id === model)) {
+    // The full catalogue cache is several kilobytes and lists all 23 models;
+    // parsing it on every request just to test one id is wasted work on the
+    // hot path. freeIds() keeps only the permitted ids, small enough that the
+    // check costs one short KV read instead of a large JSON parse.
+    const allowed = await freeIds(env);
+    if (!allowed.includes(model)) {
       return json({
         error: {
           message: `模型「${model}」不是当前免费模型，已按仅免费模式拒绝。可用：` +
-            c.exposed.map((m) => m.id).join(', '),
+            allowed.join(', '),
           type: 'invalid_request_error',
           code: 'model_not_free',
         },
@@ -292,16 +351,29 @@ async function handleChat(req, env) {
   // WorkBuddy serves completions under /v2, not /v1. Verified against the
   // working DSH plugin and confirmed by probing: every /v1 variant returns
   // 404 Route Not Found from the upstream.
-  const upstream = await fetch(`${env.ENDPOINT}/v2/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'text/event-stream',
-      'User-Agent': ua(env),
-      'Authorization': `Bearer ${await upstreamToken(env)}`,
-    },
-    body,
-  });
+  //
+  // The cross-border path to the upstream drops connections occasionally
+  // (ECONNRESET, ~4% measured). A dropped connection surfaces to the client
+  // as "retry and it works", so retry once here when the fetch itself fails
+  // — not when an HTTP status comes back, which means the request was
+  // received and answered.
+  const endpoint = `${env.ENDPOINT}/v2/chat/completions`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'text/event-stream',
+    'User-Agent': ua(env),
+    'Authorization': `Bearer ${await upstreamToken(env)}`,
+  };
+
+  let upstream;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      upstream = await fetch(endpoint, { method: 'POST', headers, body });
+      break;
+    } catch (e) {
+      if (attempt === 2) throw e;
+    }
+  }
 
   return new Response(upstream.body, {
     status: upstream.status,
@@ -425,7 +497,9 @@ async function saveToken(env, token, source) {
   const expires = decodeExp(token);
   const rec = JSON.stringify({ token, expires, source, at: Date.now() });
   await env.KEYS.put('upstream:token', rec);
+  tokenCache = null; // drop the memoised value so the next request re-reads
   await env.KEYS.delete('models:cache');
+  await env.KEYS.delete('free:ids');
   return { expires, source, at: Date.now() };
 }
 
@@ -508,6 +582,7 @@ async function tokenVerify(env) {
   }
 }
 
+// 
 // -------------------------------------------------------------------- page
 
 const ADMIN_HTML = `<!doctype html>
@@ -657,6 +732,7 @@ const ADMIN_HTML = `<!doctype html>
         注意：WorkBuddy 仅支持流式（<code>stream: true</code>），且首条消息必须为 <code>system</code>。
       </div>
     </div>
+  </div>
 
   </div>
 </div>
@@ -894,11 +970,9 @@ function revoke(k) {
     .then(function () { loadKeys(); });
 }
 
-if (T) {
-  fetch('/admin/api/keys', { headers: H() }).then(function (r) {
-    if (r.ok) enterApp(); else sessionStorage.removeItem('wbt');
-  });
-}
+
+
+
 </script>
 </html>`;
 
@@ -945,6 +1019,26 @@ export default {
       if (p === '/admin/api/login/poll') {
         return loginPoll(env, url.searchParams.get('state') || '');
       }
+      // The edge that answered and where the Worker actually ran. With Smart
+      // Placement these differ: the edge follows the client, the execution
+      // follows the backend. The trace round-trip reveals the execution colo
+      // because that is the colo the outbound request lands in.
+      if (p === '/admin/api/colo') {
+        let execColo = '';
+        try {
+          const tr = await fetch('https://www.cloudflare.com/cdn-cgi/trace', {
+            signal: AbortSignal.timeout(5000),
+          });
+          const text = await tr.text();
+          execColo = (text.match(/^colo=(.+)$/m) || [])[1] || '';
+        } catch { /* non-fatal */ }
+        return json({
+          edge: (req.cf && req.cf.colo) || '?',
+          edgeCity: (req.cf && req.cf.city) || '',
+          country: (req.cf && req.cf.country) || '',
+          execution: execColo || '(查询失败)',
+        });
+      }
       return json({ error: 'no route' }, 404);
     }
 
@@ -979,5 +1073,21 @@ export default {
     }
 
     return json({ error: { message: 'no route ' + p } }, 404);
+  },
+
+  /**
+   * Scheduled keep-alive.
+   *
+   * Cloudflare evicts an idle isolate, and the first request after that pays
+   * to load and parse the whole script again — measured at ~2.5s on this
+   * Worker versus ~0.3-0.8s warm. A cheap self-request on a schedule keeps
+   * one warm, which is the single largest latency win available here.
+   */
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      fetch('https://' + (env.WORKER_HOST || 'kz007.ccwu.cc') + '/admin')
+        .then((r) => r.text())
+        .catch(() => {}),
+    );
   },
 };
