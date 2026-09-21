@@ -221,6 +221,40 @@ async function main() {
     check('usage counted when enabled', counted.requests === 1, 'requests ' + counted.requests);
   }
 
+  // ------------------------------------------------- env fallbacks & no-store
+  {
+    const kv = makeKV();
+    const f = makeFetch([]);
+    const w = await loadWorker(ENV_BASE, f);
+
+    // A secret set under an alternate name must still be honoured.
+    const altLogin = await w.fetch(req('/admin/api/login', { method: 'POST', body: JSON.stringify({ password: 'altpw' }) }), {
+      ENDPOINT: ENV_BASE.ENDPOINT, CLIENT_VERSION: '5.5.2',
+      FREE_ONLY: 'true', REQUIRE_KEY: 'true',
+      ADMIN: 'altpw', KEYS: kv,
+    });
+    check('ADMIN fallback accepted', altLogin.status === 200, 'status ' + altLogin.status);
+
+    const page = await w.fetch(req('/admin'), { ...ENV_BASE, KEYS: kv });
+    const cc = page.headers.get('cache-control') || '';
+    check('admin page not cacheable', cc.includes('no-store'), cc);
+
+    // Upstream token under an alternate name reaches the backend.
+    let seen = null;
+    const f2 = makeFetch([['/v1/chat/completions', (u, i) => {
+      seen = i.headers['Authorization'];
+      return new Response('data: x\n\n', { status: 200 });
+    }]]);
+    const w2 = await loadWorker(ENV_BASE, f2);
+    const kv2 = makeKV({ 'key:t': JSON.stringify({ created: Date.now() }) });
+    await w2.fetch(req('/v1/chat/completions', { method: 'POST', body: '{}', headers: { authorization: 'Bearer t' } }), {
+      ENDPOINT: ENV_BASE.ENDPOINT, CLIENT_VERSION: '5.5.2',
+      FREE_ONLY: 'true', REQUIRE_KEY: 'true',
+      WORKBUDDY_TOKEN: 'alt-upstream', KEYS: kv2,
+    });
+    check('WORKBUDDY_TOKEN fallback used', seen === 'Bearer alt-upstream', String(seen));
+  }
+
   // ---------------------------------------------------------- 404 + CORS
   {
     const f = makeFetch([]);

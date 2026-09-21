@@ -2,6 +2,11 @@ name = "cf-workbuddy"
 main = "src/worker.js"
 compatibility_date = "2026-09-20"
 
+# Keep variables and secrets that exist on Cloudflare but are absent from this
+# file, so a deploy never silently wipes them. Learned from edgetunnel, which
+# uses the same flag for the same reason.
+keep_vars = true
+
 # KV holds API keys and the model cache. Create it once with:
 #   npx wrangler kv namespace create KEYS
 # then paste the returned id below.

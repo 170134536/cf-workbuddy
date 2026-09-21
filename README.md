@@ -122,6 +122,17 @@ npx wrangler secret put UPSTREAM_TOKEN
 
 Secrets: `UPSTREAM_TOKEN`, `ADMIN_PASSWORD`.
 
+Alternate names are accepted for both, so a secret set under one name is not
+silently ignored because the operator picked another:
+
+| Secret | Also accepted as |
+|---|---|
+| `UPSTREAM_TOKEN` | `WORKBUDDY_TOKEN`, `TOKEN` |
+| `ADMIN_PASSWORD` | `ADMIN`, `PASSWORD` |
+
+`keep_vars = true` is set so a deploy never wipes variables that live on
+Cloudflare but are not declared in `wrangler.toml`.
+
 ## Free vs paid models
 
 Free/paid is decided by the `credits` field: `0` means free. A missing or
@@ -161,7 +172,23 @@ npm test
 ```
 
 Drives the real Worker handler against a mock KV and fetch, covering auth
-gates, free-model filtering, key lifecycle, and the login flow (23 checks).
+gates, free-model filtering, key lifecycle, env fallbacks, and the login flow
+(28 checks). Syntax checking alone cannot catch a wrong auth gate or a
+misread response shape.
+
+## Notes on hardening
+
+The admin password is compared via a digest and an XOR-accumulating loop
+rather than `===`, so a wrong password cannot leak information through
+timing. Sessions are random KV-backed tokens rather than values derived from
+the password, so rotating the password does not invalidate a cookie that was
+already issued, and an old cookie cannot be replayed against a new password.
+
+The admin page is served with `no-store` so a stale copy cannot outlive a
+redeploy.
+
+These are defence in depth: the password is already a Worker secret and
+Workers terminates TLS.
 
 ## Licence
 

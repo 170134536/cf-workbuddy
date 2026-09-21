@@ -36,6 +36,17 @@ function json(data, status = 200, headers = {}) {
 
 // WorkBuddy rejects unknown user agents on the catalogue endpoint with
 // 400 code12403, so the client version is part of every request.
+// Accept several spellings for the upstream token, the way edgetunnel accepts
+// several for its admin password: a secret set under one name should not be
+// silently ignored because the operator picked another.
+function upstreamToken(env) {
+  return env.UPSTREAM_TOKEN || env.WORKBUDDY_TOKEN || env.TOKEN || '';
+}
+
+function adminPassword(env) {
+  return env.ADMIN_PASSWORD || env.ADMIN || env.PASSWORD || '';
+}
+
 function ua(env) {
   return UA_BASE + (env.CLIENT_VERSION || '5.5.2');
 }
@@ -149,8 +160,34 @@ async function authorized(req, env) {
   return { ok: true, rec };
 }
 
+// Hash then compare: a plain string comparison of the password leaks length
+// and content through timing, and MD5MD5 (as edgetunnel does) is not a
+// security primitive either. A digest of both sides is compared instead.
+//
+// This is defence in depth, not the primary control — the admin password is
+// already a Worker secret, and Workers itself terminates TLS.
+async function digest(text) {
+  const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  let s = '';
+  for (const x of new Uint8Array(b)) s += x.toString(16).padStart(2, '0');
+  return s;
+}
+
+async function safeEqual(a, b) {
+  const ha = await digest(String(a));
+  const hb = await digest(String(b));
+  // Both digests are fixed-length hex, so a character loop cannot leak
+  // length, and XOR-accumulating avoids an early exit on first difference.
+  if (ha.length !== hb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < ha.length; i++) diff |= ha.charCodeAt(i) ^ hb.charCodeAt(i);
+  return diff === 0;
+}
+
 // The admin session is a random token stored in KV, not a signed cookie:
 // Workers has no multi-user identity, and this keeps the code dependency-free.
+// Unlike edgetunnel's MD5MD5 cookie, the value here is not derived from the
+// password, so rotating the password cannot be replayed by an old cookie.
 async function adminSession(env, req) {
   const key = bearer(req);
   if (!key) return false;
@@ -192,7 +229,7 @@ async function handleChat(req, env) {
       'Content-Type': 'application/json',
       'Accept': 'text/event-stream',
       'User-Agent': ua(env),
-      'Authorization': `Bearer ${env.UPSTREAM_TOKEN}`,
+      'Authorization': `Bearer ${upstreamToken(env)}`,
     },
     body,
   });
@@ -214,7 +251,7 @@ async function handleChat(req, env) {
 
 async function adminLogin(req, env) {
   const { password } = await req.json().catch(() => ({}));
-  if (!password || password !== env.ADMIN_PASSWORD) {
+  if (!password || !(await safeEqual(password, adminPassword(env)))) {
     return json({ error: 'bad password' }, 401);
   }
   const token = randomToken(32);
@@ -481,7 +518,12 @@ export default {
     // ---- admin UI ----
     if (p === '/admin' || p === '/admin/') {
       return new Response(ADMIN_HTML, {
-        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          // The admin page must never be cached by a browser or an
+          // intermediate: a stale copy can keep serving after a redeploy.
+          'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+        },
       });
     }
 
