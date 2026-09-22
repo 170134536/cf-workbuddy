@@ -776,9 +776,9 @@ const ADMIN_HTML = `<!doctype html>
   <div class="card" id="login-card">
     <h2>登录管理面板</h2>
     <label for="pw">管理密码</label>
-    <input id="pw" type="password" placeholder="请输入管理密码" autocomplete="current-password">
+    <input id="pw" type="password" placeholder="请输入管理密码" autocomplete="new-password" spellcheck="false">
     <button id="login-btn" onclick="doLogin()">登录</button>
-    <div class="msg err" id="login-msg"></div>
+    <div class="msg" id="login-msg"></div>
   </div>
 
   <div id="main" class="hide">
@@ -897,27 +897,49 @@ function before(ms) {
 }
 
 function doLogin() {
-  var pw = document.getElementById('pw').value;
-  if (!pw) return;
-  document.getElementById('login-btn').disabled = true;
+  var input = document.getElementById('pw');
+  var btn = document.getElementById('login-btn');
+  var pw = input.value.trim();
+
+  // Empty input is the most common miss and used to fail silently, which
+  // reads as "the page is broken" rather than "type something".
+  if (!pw) {
+    show('login-msg', 'err', '✗ 请先输入管理密码');
+    input.focus();
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = '登录中…';
+  show('login-msg', 'info', '正在验证密码…');
+
   fetch('/admin/api/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ password: pw })
   }).then(function (r) { return r.json().then(function (j) { return { s: r.status, j: j }; }); })
     .then(function (o) {
-      document.getElementById('login-btn').disabled = false;
+      btn.disabled = false;
+      btn.textContent = '登录';
       if (o.j.token) {
         T = o.j.token;
         sessionStorage.setItem('wbt', T);
-        enterApp();
+        show('login-msg', 'ok', '✓ 密码正确，正在进入管理面板…');
+        // Give the confirmation a moment to be read before the panel swaps in.
+        setTimeout(enterApp, 350);
+      } else if (o.s === 401) {
+        show('login-msg', 'err', '✗ 密码错误，请重新输入');
+        input.value = '';
+        input.focus();
       } else {
-        show('login-msg', 'err', '密码错误，请重试');
+        show('login-msg', 'err', '✗ 登录失败（HTTP ' + o.s + '）：' + esc(o.j.error || '未知错误'));
+        input.focus();
       }
     })
     .catch(function (e) {
-      document.getElementById('login-btn').disabled = false;
-      show('login-msg', 'err', '请求失败：' + esc(e.message));
+      btn.disabled = false;
+      btn.textContent = '登录';
+      show('login-msg', 'err', '✗ 请求失败：' + esc(e.message));
     });
 }
 
@@ -1158,8 +1180,27 @@ function revoke(k) {
     .then(function () { loadKeys(); });
 }
 
-
-
+// Restore a previous session on load. Without this, refreshing the page threw
+// away a perfectly valid session and dumped the operator back on the password
+// screen, which reads as "login is broken". A stale token is cleared quietly
+// so the password form is presented cleanly.
+(function restore() {
+  if (!T) { document.getElementById('pw').focus(); return; }
+  fetch('/admin/api/token', { headers: H() })
+    .then(function (r) {
+      if (r.status === 401) {
+        sessionStorage.removeItem('wbt');
+        T = '';
+        document.getElementById('pw').focus();
+        return null;
+      }
+      return r.json().then(function () { enterApp(); });
+    })
+    .catch(function () {
+      // Network blip: leave the session alone rather than logging the user out.
+      document.getElementById('pw').focus();
+    });
+})();
 
 </script>
 </html>`;
