@@ -1095,7 +1095,11 @@ function saveManual() {
   if (!raw) return;
   var name = document.getElementById('manual-name').value.trim();
   // Support several tokens at once, one per line: all join the rotation pool.
-  var tokens = raw.split(/\r?\n/).map(function (s) { return s.trim(); }).filter(Boolean);
+  // NOTE: this lives inside a template literal, so the regex backslashes are
+  // doubled — otherwise they would be emitted as real CR/LF characters into
+  // the browser script and the whole script block would fail to parse (which
+  // is exactly how "clicking login does nothing" happened).
+  var tokens = raw.split(/\\r?\\n/).map(function (s) { return s.trim(); }).filter(Boolean);
   if (!tokens.length) return;
 
   var box = show('tok-msg', 'info', '正在添加 ' + tokens.length + ' 个凭证…');

@@ -191,6 +191,24 @@ async function main() {
     const html = await res.text();
     check('admin page renders', res.status === 200 && html.includes('WorkBuddy 中转'), 'status ' + res.status);
     check('admin page has login handler', html.includes('/admin/api/login'));
+
+    // The inline <script> is embedded in a template literal. A single
+    // un-escaped backslash sequence (e.g. /\r?\n/) gets emitted as real CR/LF
+    // characters and silently breaks the ENTIRE script — every button on the
+    // page stops working, which reads as "clicking login does nothing". Pin
+    // that the generated script actually parses.
+    const sm = html.match(/<script>([\s\S]*?)<\/script>/);
+    check('admin page script extracted', !!sm, 'script block found');
+    if (sm) {
+      let parses = false;
+      try {
+        new Function(sm[1]); // parse-only; throws SyntaxError on the bad regex
+        parses = true;
+      } catch {
+        parses = false;
+      }
+      check('admin page script parses', parses, 'generated <script> must be valid JS');
+    }
   }
 
   // ---------------------------------------------------------- login flow
